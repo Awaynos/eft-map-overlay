@@ -1,0 +1,50 @@
+{
+  "name": "eft-map-overlay",
+  "version": "1.2.3",
+  "description": "Прозрачная интерактивная карта eft.su поверх окна Escape from Tarkov",
+  "main": "main.js",
+  "author": "Awaynos",
+  "license": "MIT",
+  "homepage": "https://eft.su",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win portable",
+    "dist:dir": "electron-builder --win dir"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.eft.mapoverlay",
+    "productName": "EFT Map Overlay",
+    "copyright": "Copyright (c) 2026 Awaynos",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "cleanup.js",
+      "toolbar_payload.js",
+      "assets/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "artifactName": "EFT-Map-Overlay-${version}-portable.${ext}"
+    },
+    "portable": {
+      "artifactName": "EFT-Map-Overlay-${version}-portable.exe"
+    },
+    "electronLanguages": ["ru", "en"],
+    "npmRebuild": false
+  }
+}

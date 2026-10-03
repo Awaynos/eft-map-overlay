@@ -1,0 +1,14 @@
+# Зависимости (устанавливаются командой npm install)
+node_modules/
+
+# Сборка (exe публикуется отдельно через GitHub Releases)
+release/
+dist/
+
+# Временные и логические файлы
+*.log
+
+# Кэш
+npm-debug.log*
+.DS_Store
+Thumbs.db
