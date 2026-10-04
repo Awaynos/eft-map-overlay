@@ -5,6 +5,9 @@ node_modules/
 release/
 dist/
 
+# Резервные копии сборок
+backup-*/
+
 # Временные и логические файлы
 *.log
 

@@ -1,6 +1,6 @@
 {
   "name": "eft-map-overlay",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "Прозрачная интерактивная карта eft.su поверх окна Escape from Tarkov",
   "main": "main.js",
   "author": "Awaynos",

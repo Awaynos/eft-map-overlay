@@ -9,5 +9,8 @@ contextBridge.exposeInMainWorld('eftOverlay', {
   hide: () => ipcRenderer.send('hide'),
   quit: () => ipcRenderer.send('quit'),
   openExternal: () => ipcRenderer.send('open-external'),
+  checkUpdate: () => ipcRenderer.send('check-update'),
+  applyUpdate: () => ipcRenderer.send('apply-update'),
+  onUpdateStatus: (cb) => ipcRenderer.on('update-status', (_e, s) => cb(s)),
   onStateChange: (cb) => ipcRenderer.on('state-changed', (_e, s) => cb(s)),
 });

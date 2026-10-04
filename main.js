@@ -6,8 +6,11 @@
 const { app, BrowserWindow, globalShortcut, ipcMain, Tray, Menu, screen, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const https = require('https');
+const { spawn } = require('child_process');
 
 const APP_NAME = 'EFT Map Overlay';
+const GITHUB_REPO = 'Awaynos/eft-map-overlay';
 
 const MAPS = [
   { slug: 'factory',              name: 'Завод' },
@@ -26,6 +29,87 @@ const MAPS = [
 
 let win = null;
 let tray = null;
+let isFirstLaunch = true;
+
+// Плавная анимация прозрачности окна (без резких появлений)
+function animateOpacity(targetWin, from, to, durationMs) {
+  return new Promise((resolve) => {
+    if (!targetWin || targetWin.isDestroyed()) { resolve(); return; }
+    const start = Date.now();
+    const tick = () => {
+      if (!targetWin || targetWin.isDestroyed()) { resolve(); return; }
+      const p = Math.min(1, (Date.now() - start) / durationMs);
+      const eased = p * p * (3 - 2 * p); // smoothstep
+      const val = from + (to - from) * eased;
+      try { targetWin.setOpacity(Math.max(0, Math.min(1, val))); } catch (_) {}
+      if (p < 1) { setTimeout(tick, 16); } else { resolve(); }
+    };
+    tick();
+  });
+}
+
+// Сплэш-экран: start.png по центру монитора, плавно появляется и исчезает
+function showSplash() {
+  return new Promise((resolve) => {
+    const imgPath = path.join(__dirname, 'assets', 'start.png');
+    let img = null;
+    try { img = nativeImage.createFromPath(imgPath); } catch (_) {}
+    if (!img || img.isEmpty()) { resolve(); return; }
+
+    let s = img.getSize();
+    const wa = screen.getPrimaryDisplay().workArea;
+
+    // Масштабируем, чтобы картинка целиком помещалась на экран
+    const maxW = Math.round(wa.width * 0.75);
+    const maxH = Math.round(wa.height * 0.75);
+    const ratio = Math.min(1, maxW / s.width, maxH / s.height);
+    const w = Math.round(s.width * ratio);
+    const h = Math.round(s.height * ratio);
+
+    const x = Math.round(wa.x + (wa.width - w) / 2);
+    const y = Math.round(wa.y + (wa.height - h) / 2);
+
+    const splash = new BrowserWindow({
+      x, y,
+      width: w,
+      height: h,
+      frame: false,
+      transparent: true,
+      backgroundColor: '#00000000',
+      resizable: false,
+      movable: false,
+      alwaysOnTop: true,
+      skipTaskbar: true,
+      hasShadow: false,
+      show: false,
+      webPreferences: { contextIsolation: true, nodeIntegration: false },
+    });
+    splash.setAlwaysOnTop(true, 'screen-saver');
+    splash.setVisibleOnAllWorkspaces(true);
+    splash.setIgnoreMouseEvents(true, { forward: true });
+    splash.setOpacity(0);
+    splash.loadFile(path.join(__dirname, 'assets', 'splash.html')).then(() => {
+      splash.show();
+      // плавное появление
+      animateOpacity(splash, 0, 1, 450).then(() => {
+        // подержать
+        setTimeout(() => {
+          animateOpacity(splash, 1, 0, 450).then(() => {
+            if (!splash.isDestroyed()) splash.destroy();
+            resolve();
+          });
+        }, 1400);
+      });
+    }).catch(() => { if (!splash.isDestroyed()) splash.destroy(); resolve(); });
+  });
+}
+
+// Плавное появление главного окна после сплэша
+function fadeInMainWindow() {
+  if (!win || win.isDestroyed()) return Promise.resolve();
+  if (!win.isVisible()) win.show();
+  return animateOpacity(win, 0, state.opacity, 600);
+}
 
 const state = {
   visible: true,
@@ -177,6 +261,7 @@ function createWindow() {
     fullscreenable: false,
     hasShadow: false,
     title: APP_NAME,
+    show: false, // окно появляется плавно после сплэша
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -188,7 +273,7 @@ function createWindow() {
   win.setMenu(null);
   win.setAlwaysOnTop(true, 'screen-saver'); // поверх полноэкранных окон игры
   win.setVisibleOnAllWorkspaces(true);
-  win.setOpacity(state.opacity);
+  win.setOpacity(0); // переход от сплэша будет плавным
   applyClickThrough();
 
   win.loadURL(mapUrl(currentMap().slug));
@@ -207,6 +292,13 @@ function createWindow() {
       await injectCleanup();
       await injectToolbar();
       sendState();
+      // Плавное появление после сплэша (только первый раз)
+      if (isFirstLaunch) {
+        isFirstLaunch = false;
+        await fadeInMainWindow();
+      } else {
+        win.setOpacity(state.opacity);
+      }
     })();
   });
   win.webContents.on('render-process-gone', () => { /* приложение живёт дальше */ });
@@ -249,6 +341,153 @@ ipcMain.on('open-external', () => {
   const { shell } = require('electron');
   shell.openExternal(mapUrl(currentMap().slug));
 });
+ipcMain.on('check-update', async (e) => {
+  const result = await checkForUpdate();
+  if (!e.sender.isDestroyed()) e.sender.send('update-status', result);
+});
+ipcMain.on('apply-update', async (e) => {
+  const result = await applyUpdate();
+  if (!e.sender.isDestroyed()) e.sender.send('update-status', result);
+});
+
+// ----- Автообновление (по образцу tg-ws-proxy: GitHub Releases API) -----
+const LATEST_API = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
+const userDataPath = () => app.getPath('userData');
+const updateCacheFile = () => path.join(userDataPath(), 'update-cache.json');
+
+function httpGetJson(url) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, {
+      headers: {
+        'Accept': 'application/vnd.github+json',
+        'User-Agent': `${APP_NAME}-updater`,
+      },
+      timeout: 12000,
+    }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        httpGetJson(res.headers.location).then(resolve, reject);
+        return;
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        reject(new Error(`HTTP ${res.statusCode}`));
+        return;
+      }
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); } catch (err) { reject(err); }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(new Error('Timeout')); });
+  });
+}
+
+function parseVersion(v) {
+  const s = String(v || '').trim().replace(/^[vV]/, '');
+  return s.split('.').map((n) => parseInt(n, 10) || 0);
+}
+function versionGreater(a, b) {
+  const ta = parseVersion(a), tb = parseVersion(b);
+  for (let i = 0; i < Math.max(ta.length, tb.length); i++) {
+    const x = ta[i] || 0, y = tb[i] || 0;
+    if (x > y) return true;
+    if (x < y) return false;
+  }
+  return false;
+}
+
+async function checkForUpdate() {
+  const base = { repo: GITHUB_REPO, latest: null, url: null, hasUpdate: false, current: app.getVersion() };
+  try {
+    const rel = await httpGetJson(LATEST_API);
+    const tag = (rel.tag_name || '').trim();
+    base.latest = tag;
+    base.url = rel.html_url || `https://github.com/${GITHUB_REPO}/releases`;
+    base.hasUpdate = !!tag && versionGreater(tag, app.getVersion());
+    base.assets = (rel.assets || []).filter((a) => /\.exe$/i.test(a.name))
+      .map((a) => ({ name: a.name, url: a.browser_download_url, size: a.size }));
+    return { ok: true, ...base };
+  } catch (err) {
+    return { ok: false, error: String(err && err.message || err), ...base };
+  }
+}
+
+async function downloadFile(url, dest, onProgress) {
+  return new Promise((resolve, reject) => {
+    const out = fs.createWriteStream(dest);
+    const handler = (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        const next = https.get(res.headers.location, { headers: { 'User-Agent': `${APP_NAME}-updater` } }, handler);
+        next.on('error', reject);
+        return;
+      }
+      if (res.statusCode !== 200) { res.resume(); reject(new Error(`HTTP ${res.statusCode}`)); return; }
+      const total = parseInt(res.headers['content-length'] || '0', 10);
+      let done = 0;
+      res.on('data', (c) => { done += c.length; if (onProgress && total) onProgress(done / total); });
+      res.pipe(out);
+    };
+    out.on('finish', () => { out.close(() => resolve(dest)); });
+    out.on('error', reject);
+    const req = https.get(url, { headers: { 'User-Agent': `${APP_NAME}-updater` } }, handler);
+    req.on('error', reject);
+  });
+}
+
+// Возвращает путь к portable exe (только если запущено из portable-сборки)
+function portableExePath() {
+  return process.env.PORTABLE_EXECUTABLE_FILE || null;
+}
+
+async function applyUpdate() {
+  const check = await checkForUpdate();
+  if (!check.ok) return { ok: false, stage: 'check', message: check.error };
+  if (!check.hasUpdate) return { ok: false, stage: 'none', message: 'У вас уже последняя версия' };
+  const exe = check.assets && check.assets.find((a) => /portable/i.test(a.name));
+  if (!exe) return { ok: false, stage: 'asset', message: 'Файл обновления не найден в релизе' };
+
+  const target = portableExePath();
+  if (!target) return { ok: false, stage: 'portable', message: 'Обновление доступно только в portable-версии' };
+
+  const tmpDir = path.join(app.getPath('temp'), `${APP_NAME.replace(/\s/g,'_')}-update`);
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const tmpExe = path.join(tmpDir, `update-${Date.now()}.exe`);
+  const batFile = path.join(tmpDir, `run-update-${Date.now()}.bat`);
+
+  try {
+    await downloadFile(exe.url, tmpExe);
+  } catch (err) {
+    return { ok: false, stage: 'download', message: String(err && err.message || err) };
+  }
+
+  // bat: ждёт выхода, копирует новый exe поверх старого, запускает его, удаляет себя
+  const bat = [
+    '@echo off',
+    'setlocal',
+    'set SRC="' + tmpExe + '"',
+    'set DST="' + target + '"',
+    'set SELF="' + batFile + '"',
+    ':wait',
+    'tasklist /FI "IMAGENAME eq ' + target.split(/[\\/]/).pop() + '" 2>nul | find /I "' + target.split(/[\\/]/).pop() + '" >nul',
+    'if not errorlevel 1 ( ping 127.0.0.1 -n 2 >nul & goto wait )',
+    'copy /Y %SRC% %DST% >nul',
+    'if errorlevel 1 pause',
+    'start "" %DST%',
+    'del /F /Q "%~f0"',
+  ].join('\r\n');
+  fs.writeFileSync(batFile, bat, 'utf8');
+
+  const p = spawn('cmd.exe', ['/c', batFile], { detached: true, stdio: 'ignore', windowsHide: true });
+  p.unref();
+
+  // закрыть приложение — bat подхватит после выхода
+  setTimeout(() => { app.quit(); }, 300);
+  return { ok: true, stage: 'applying' };
+}
 
 // ----- Горячие клавиши -----
 function registerHotkeys() {
@@ -298,9 +537,11 @@ function createTray() {
   tray.on('click', toggleVisible);
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   app.setName(APP_NAME);
   loadConfig();
+  // Сначала плавный сплэш-экран, затем плавное появление карты
+  await showSplash();
   createWindow();
   createTray();
   registerHotkeys();

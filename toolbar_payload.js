@@ -49,10 +49,12 @@
     </label>
     <div class="eft-row eft-btns">
       <button id="eft-clicks" class="eft-btn">Клики: в игру</button>
+      <button id="eft-update" class="eft-btn" title="Проверить обновления на GitHub">Обновить</button>
       <button id="eft-hide" class="eft-btn">Скрыть</button>
       <button id="eft-external" class="eft-btn">В браузере</button>
       <button id="eft-quit" class="eft-btn eft-danger">Выход</button>
     </div>
+    <div id="eft-update-status" style="display:none;margin-top:6px;font-size:11px;opacity:.85;-webkit-app-region:no-drag;"></div>
     <div class="eft-hint">Ctrl+Shift+M — клики сквозь окно / по карте</div>
   `;
   const st = document.createElement('style');
@@ -98,6 +100,44 @@
   panel.querySelector('#eft-hide').addEventListener('click', () => window.eftOverlay.hide());
   panel.querySelector('#eft-external').addEventListener('click', () => window.eftOverlay.openExternal());
   panel.querySelector('#eft-quit').addEventListener('click', () => window.eftOverlay.quit());
+
+  // ---- Обновление ----
+  const updateBtn = panel.querySelector('#eft-update');
+  const updateStatus = panel.querySelector('#eft-update-status');
+  const setStatus = (text, color) => {
+    if (!updateStatus) return;
+    updateStatus.style.display = 'block';
+    updateStatus.textContent = text;
+    updateStatus.style.color = color || '#eee';
+  };
+  updateBtn.addEventListener('click', () => {
+    updateBtn.disabled = true;
+    setStatus('Проверяю обновления…', '#aaa');
+    window.eftOverlay.checkUpdate();
+  });
+  window.eftOverlay.onUpdateStatus((st) => {
+    updateBtn.disabled = false;
+    if (!st || !st.ok) {
+      if (st && st.stage === 'none') setStatus('У вас последняя версия ✓', '#43b581');
+      else if (st && st.stage === 'portable') setStatus('Обновление возможно только в portable-версии', '#ffb020');
+      else if (st && st.stage === 'applying') setStatus('Обновление скачано, перезапуск…', '#43b581');
+      else setStatus('Ошибка: ' + ((st && st.message) || 'нет связи с GitHub'), '#ff8a80');
+      return;
+    }
+    if (st.hasUpdate) {
+      setStatus('Доступна версия ' + st.latest + ' — нажмите ещё раз для обновления', '#6db3ff');
+      const apply = () => {
+        updateBtn.removeEventListener('click', apply);
+        updateBtn.disabled = true;
+        setStatus('Скачиваю обновление…', '#aaa');
+        window.eftOverlay.applyUpdate();
+      };
+      updateBtn.addEventListener('click', apply);
+      updateBtn.textContent = 'Обновить!';
+    } else {
+      setStatus('Актуальная версия: ' + st.current + ' ✓', '#43b581');
+    }
+  });
 
   // Синхронизация состояния из главного процесса
   window.eftOverlay.onStateChange((s) => {
