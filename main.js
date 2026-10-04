@@ -4,9 +4,9 @@
 // НЕ читает память игры — это обычное окно поверх всех окон (безопасно для BattlEye).
 
 const { app, BrowserWindow, globalShortcut, ipcMain, Tray, Menu, screen, nativeImage } = require('electron');
+const { net } = require('electron'); // сетевой стек Chromium: учитывает системный прокси
 const path = require('path');
 const fs = require('fs');
-const https = require('https');
 const { spawn } = require('child_process');
 
 const APP_NAME = 'EFT Map Overlay';
@@ -355,34 +355,15 @@ const LATEST_API = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`
 const userDataPath = () => app.getPath('userData');
 const updateCacheFile = () => path.join(userDataPath(), 'update-cache.json');
 
-function httpGetJson(url) {
-  return new Promise((resolve, reject) => {
-    const req = https.get(url, {
-      headers: {
-        'Accept': 'application/vnd.github+json',
-        'User-Agent': `${APP_NAME}-updater`,
-      },
-      timeout: 12000,
-    }, (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        res.resume();
-        httpGetJson(res.headers.location).then(resolve, reject);
-        return;
-      }
-      if (res.statusCode !== 200) {
-        res.resume();
-        reject(new Error(`HTTP ${res.statusCode}`));
-        return;
-      }
-      let data = '';
-      res.on('data', (c) => { data += c; });
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); } catch (err) { reject(err); }
-      });
-    });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(new Error('Timeout')); });
+async function httpGetJson(url) {
+  const resp = await net.fetch(url, {
+    headers: {
+      'Accept': 'application/vnd.github+json',
+      'User-Agent': `${APP_NAME}-updater`,
+    },
   });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+  return await resp.json();
 }
 
 function parseVersion(v) {
@@ -416,26 +397,35 @@ async function checkForUpdate() {
 }
 
 async function downloadFile(url, dest, onProgress) {
-  return new Promise((resolve, reject) => {
-    const out = fs.createWriteStream(dest);
-    const handler = (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        res.resume();
-        const next = https.get(res.headers.location, { headers: { 'User-Agent': `${APP_NAME}-updater` } }, handler);
-        next.on('error', reject);
-        return;
-      }
-      if (res.statusCode !== 200) { res.resume(); reject(new Error(`HTTP ${res.statusCode}`)); return; }
-      const total = parseInt(res.headers['content-length'] || '0', 10);
-      let done = 0;
-      res.on('data', (c) => { done += c.length; if (onProgress && total) onProgress(done / total); });
-      res.pipe(out);
-    };
-    out.on('finish', () => { out.close(() => resolve(dest)); });
-    out.on('error', reject);
-    const req = https.get(url, { headers: { 'User-Agent': `${APP_NAME}-updater` } }, handler);
-    req.on('error', reject);
+  const resp = await net.fetch(url, {
+    headers: { 'User-Agent': `${APP_NAME}-updater` },
+    redirect: 'follow',
   });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+  if (!resp.body) throw new Error('Пустой ответ от сервера');
+
+  const total = parseInt(resp.headers.get('content-length') || '0', 10);
+  let done = 0;
+  const out = fs.createWriteStream(dest);
+  const reader = resp.body.getReader();
+
+  await new Promise((resolve, reject) => {
+    const pump = async () => {
+      try {
+        const { done: isDone, value } = await reader.read();
+        if (isDone) { out.end(); resolve(); return; }
+        out.write(Buffer.from(value));
+        done += value.length;
+        if (onProgress && total) onProgress(done / total);
+        pump();
+      } catch (err) {
+        out.destroy(err);
+        reject(err);
+      }
+    };
+    pump();
+  });
+  return dest;
 }
 
 // Возвращает путь к portable exe (только если запущено из portable-сборки)
