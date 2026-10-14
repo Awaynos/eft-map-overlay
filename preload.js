@@ -11,6 +11,8 @@ contextBridge.exposeInMainWorld('eftOverlay', {
   openExternal: () => ipcRenderer.send('open-external'),
   checkUpdate: () => ipcRenderer.send('check-update'),
   applyUpdate: () => ipcRenderer.send('apply-update'),
+  toggleMaximize: () => ipcRenderer.send('toggle-maximize'),
+  setInteractiveZones: (zones) => ipcRenderer.send('interactive-zones', zones),
   onUpdateStatus: (cb) => ipcRenderer.on('update-status', (_e, s) => cb(s)),
   onStateChange: (cb) => ipcRenderer.on('state-changed', (_e, s) => cb(s)),
 });

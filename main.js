@@ -158,6 +158,7 @@ function applyClickThrough() {
 // иначе клики проходят в игру. Срабатывает только в режиме "клики в игру".
 // Реализовано надёжно: main-процесс сам следит за курсором через screen.
 let hotzoneTimer = null;
+let interactiveZones = []; // зоны элементов сайта (переключатель, панель), где клики идут в оверлей
 
 function startHotzoneTimer() {
   if (hotzoneTimer) clearInterval(hotzoneTimer);
@@ -167,18 +168,35 @@ function startHotzoneTimer() {
       const pt = screen.getCursorScreenPoint();
       const b = win.getBounds();
       const pad = 6;
-      // Развёрнутая панель примерно ~250x260 в левом верхнем углу окна,
-      // свёрнутая — плашка 40x40.
+      // Наш тулбар (левый верх): развёрнутая панель ~270x320, свёрнутая плашка ~52x52
       const zw = state.toolbarCollapsed ? 52 : 270;
       const zh = state.toolbarCollapsed ? 52 : 320;
-      const inZone = pt.x >= b.x + pad && pt.x <= b.x + pad + zw &&
-                     pt.y >= b.y + pad && pt.y <= b.y + pad + zh;
+      let inZone = pt.x >= b.x + pad && pt.x <= b.x + pad + zw &&
+                   pt.y >= b.y + pad && pt.y <= b.y + pad + zh;
+
+      // Зоны элементов сайта (переключатель/панель) — тоже кликабельны
+      if (!inZone && interactiveZones.length) {
+        for (const z of interactiveZones) {
+          const sx = b.x + z.x, sy = b.y + z.y;
+          if (pt.x >= sx && pt.x <= sx + z.w && pt.y >= sy && pt.y <= sy + z.h) { inZone = true; break; }
+        }
+      }
+
       const shouldIgnore = !inZone;
       if (win.isIgnoringMouseEvents() !== shouldIgnore) {
         win.setIgnoreMouseEvents(shouldIgnore, { forward: true });
       }
     } catch (_) { /* окно в процессе перестроения */ }
-  }, 40);
+  }, 30);
+}
+
+// Развернуть/восстановить окно оверлея
+function toggleMaximize() {
+  if (!win || win.isDestroyed()) return;
+  try {
+    if (win.isMaximized()) win.unmaximize();
+    else win.maximize();
+  } catch (_) {}
 }
 
 function stopHotzoneTimer() {
@@ -341,6 +359,10 @@ ipcMain.on('open-external', () => {
   const { shell } = require('electron');
   shell.openExternal(mapUrl(currentMap().slug));
 });
+ipcMain.on('toggle-maximize', () => toggleMaximize());
+ipcMain.on('interactive-zones', (_e, zones) => {
+  interactiveZones = Array.isArray(zones) ? zones.filter((z) => z && typeof z.x === 'number') : [];
+});
 ipcMain.on('check-update', async (e) => {
   const result = await checkForUpdate();
   if (!e.sender.isDestroyed()) e.sender.send('update-status', result);
@@ -443,10 +465,12 @@ async function applyUpdate() {
   const target = portableExePath();
   if (!target) return { ok: false, stage: 'portable', message: 'Обновление доступно только в portable-версии' };
 
-  const tmpDir = path.join(app.getPath('temp'), `${APP_NAME.replace(/\s/g,'_')}-update`);
+  const tmpDir = path.join(app.getPath('temp'), 'EFTMapOverlay-update');
   fs.mkdirSync(tmpDir, { recursive: true });
-  const tmpExe = path.join(tmpDir, `update-${Date.now()}.exe`);
-  const batFile = path.join(tmpDir, `run-update-${Date.now()}.bat`);
+  const stamp = Date.now();
+  const tmpExe = path.join(tmpDir, `new-${stamp}.exe`);
+  const batFile = path.join(tmpDir, `apply-${stamp}.bat`);
+  const vbsFile = path.join(tmpDir, `run-${stamp}.vbs`);
 
   try {
     await downloadFile(exe.url, tmpExe);
@@ -454,27 +478,39 @@ async function applyUpdate() {
     return { ok: false, stage: 'download', message: String(err && err.message || err) };
   }
 
-  // bat: ждёт выхода, копирует новый exe поверх старого, запускает его, удаляет себя
+  // bat: ждёт освобождения файла, копирует новый exe поверх старого, запускает его и удаляет себя.
+  // Без tasklist/find (они давали лишнее окно консоли).
   const bat = [
     '@echo off',
     'setlocal',
     'set SRC="' + tmpExe + '"',
     'set DST="' + target + '"',
-    'set SELF="' + batFile + '"',
+    'set /a tries=0',
     ':wait',
-    'tasklist /FI "IMAGENAME eq ' + target.split(/[\\/]/).pop() + '" 2>nul | find /I "' + target.split(/[\\/]/).pop() + '" >nul',
-    'if not errorlevel 1 ( ping 127.0.0.1 -n 2 >nul & goto wait )',
-    'copy /Y %SRC% %DST% >nul',
-    'if errorlevel 1 pause',
+    'copy /Y %SRC% %DST% >nul 2>&1',
+    'if not errorlevel 1 goto done',
+    'set /a tries+=1',
+    'if %tries% GEQ 120 goto fail',
+    'ping 127.0.0.1 -n 2 >nul',
+    'goto wait',
+    ':done',
     'start "" %DST%',
     'del /F /Q "%~f0"',
+    'exit /b 0',
+    ':fail',
+    'exit /b 1',
   ].join('\r\n');
   fs.writeFileSync(batFile, bat, 'utf8');
 
-  const p = spawn('cmd.exe', ['/c', batFile], { detached: true, stdio: 'ignore', windowsHide: true });
+  // VBS запускает bat полностью скрыто (окно консоли не появляется)
+  const vbs = 'Set sh = CreateObject("WScript.Shell")\r\n' +
+              'sh.Run "cmd /c ""' + batFile + '""", 0, False\r\n';
+  fs.writeFileSync(vbsFile, vbs, 'utf8');
+
+  const p = spawn('wscript.exe', [vbsFile], { detached: true, stdio: 'ignore', windowsHide: true });
   p.unref();
 
-  // закрыть приложение — bat подхватит после выхода
+  // закрыть приложение — скрипт скопирует новый exe после выхода
   setTimeout(() => { app.quit(); }, 300);
   return { ok: true, stage: 'applying' };
 }
